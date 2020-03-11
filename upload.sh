@@ -15,12 +15,14 @@ if [ "$1" == "-h" ]; then
     exit 0
 fi
 
-
+MINSPACEFREE=1000000000
 
 ############################################################################################################################
 # CONFIG HANDLING
 ############################################################################################################################
 FOLDER=$1
+
+SHORTHOSTNAME=$(hostname -s)
 
 if [ -z "$NOOP" ]; then
     NOOP=0
@@ -103,9 +105,21 @@ fi
 # FUNCTION DEFINITIONS
 ############################################################################################################################
 
-# uploads a file to the configured bucket
 s3upload () {
-    file=$1
+    # uploads a file to the configured bucket
+    # sets UPLOADSTATUS
+    if [ -z "$1" ] || [ "$(echo -n "$1" | tr -d '[:space:]')" == "" ]; then
+        echo "[!] s3upload() with no path, exiting"
+        exit 1
+    fi
+    local file
+    local dateValue
+    local stringToSign
+    local signature
+    local RETVAL
+    
+    file=$(echo "$1" | awk -F'/' '{print $NF }')
+
     echo "[>] s3upload(${file}) starting"
     dateValue="$(date -R)"
     stringToSign="PUT\n\napplication/x-compressed-tar\n${dateValue}\n/${AWS_BUCKET}/${file}"
@@ -118,6 +132,9 @@ s3upload () {
             -H "Content-Type: application/x-compressed-tar" \
             -H "Authorization: AWS ${s3Key}:${signature}" \
             "https://${AWS_BUCKET}.s3-${AWS_REGION}.amazonaws.com/${file}" 2>&1 )
+
+        echo "[!] Removing temp file ${TEMPARCHIVEDIR}/${file}"
+        rm -f "${TEMPARCHIVEDIR}/${file}"
     else
         echo "[!] Skipping upload, setting it as successful for debugging"
         RETVAL="HTTP/1.1 200"
@@ -132,19 +149,22 @@ s3upload () {
         echo "###############################################"
         exit 1
     fi
-    # reset variables
-    RETVAL=""
-    stringToSign=""
-    signature=""
-    dateValue=""
-
 }
 
 s3checkfile () {
-    file=$1
+    # "returns" filestatus
+    local file
+    local dateValue
+    local stringToSign
+    local signature
+    local RETVAL
+    
+    file=$(echo "$1" | awk -F'/' '{print $NF }')
     echo "[>] s3checkfile(${file}) starting"
     filestatus=0
+    
     dateValue=$(date -R)
+    
     stringToSign="HEAD\n\napplication/x-compressed-tar\n${dateValue}\n/${AWS_BUCKET}/${file}"
     signature=$(echo -en "${stringToSign}" | openssl sha1 -hmac "${s3Secret}" -binary | base64)
     if [ $NOOP -eq 0 ]; then
@@ -161,34 +181,44 @@ s3checkfile () {
         filestatus="200"
     fi
     echo "[<] s3checkfile(${file}) == ${filestatus}"
-    # reset variables
-    RETVAL=""
-    signature=""
-    stringToSign=""
-    dateValue=""
 }
 
 compressfolder () {
-    # sets FILENAME (short filename) and TARFILE, the full path to the tar
+    # sets 
+    # FILENAME (short filename) and 
+    # TARFILE, the full path to the tar
+    
+    local index
+    local splunkbucket
+    local ARCHIVEFOLDER
+    local FOLDERSIZE
+
     ARCHIVEFOLDER="$1"
 
-    shorthost=$(hostname -s)
+    
     index=$(echo "${ARCHIVEFOLDER}" | awk -F'/' '{print $(NF-2)}')
     splunkbucket=$(echo "${ARCHIVEFOLDER}" | awk -F'/' '{print $NF}')
-    FILENAME="${shorthost}-${index}-${splunkbucket}.tar"
+    FILENAME="${SHORTHOSTNAME}-${index}-${splunkbucket}.tar"
     TARFILE="${TEMPARCHIVEDIR}/${FILENAME}"
 
+    FOLDERSIZE=$(du -B1024 -s "${ARCHIVEFOLDER}" | awk -F' ' '{print $1}')
+
+    echo "[!] Folder size: ${FOLDERSIZE}K"
+    
     if [ $NOOP -eq 1 ]; then
         echo "[!] NOOP compressfolder(${ARCHIVEFOLDER})"
     else
         echo "[>] compressfolder(${ARCHIVEFOLDER}) Starting"
-        tar --no-acls -cf "${TARFILE}" "${ARCHIVEFOLDER}"
+        if [ $FOLDERSIZE -gt 304800 ]; then
+            echo "[!] splitting into 300MB chunks"
+            tar --no-acls -cf - "${ARCHIVEFOLDER}" | split -b 300m - "${TARFILE}." 
+            echo "[!] Combined archive size: $(du -sh "${TARFILE}.*")"
+        else
+            tar --no-acls -cf "${TARFILE}" "${ARCHIVEFOLDER}"
+            echo "[!] Archive size: $(du -sh "${TARFILE}")"
+        fi
         echo "[<] compressfolder(${ARCHIVEFOLDER}) == ${TARFILE}"
     fi
-    shorthost=""
-    index=""
-    splunkbucket=""
-    ARCHIVEFOLDER=""
     }
 
 
@@ -206,23 +236,32 @@ STARTTIME=$(date +%s)
 RUNTIME=0
 
 # only run while we need to
-echo "starting"
+echo "[!] Starting upload.sh main loop"
 while [ $RUNTIME -lt $MAXTIME ]; do
-    echo "."
+    # keep a minimum of a GB free on the disk
+    SPACEFREE=$(df -B1 "${TEMPARCHIVEDIR}" | grep -v -E 'U.*\s+A.*\s+U.*' | awk '{print $3 }' | tr -d '[:space:]')
+    echo "[!] Free disk: ${SPACEFREE}"
+    if [ $SPACEFREE -lt $MINSPACEFREE ]; then
+        echo "Space less than ${MINSPACEFREE}, quitting"
+        exit 1
+    fi
+
     for FOLDERNAME in $(find "${FOLDER}" -maxdepth 2 -type d | grep 'db/db_'); do
         echo "[>] Main loop handling ${FOLDERNAME}"
         compressfolder "${FOLDERNAME}"
+        
+        for FILENAME in $(find "${TEMPARCHIVEDIR}" -maxdepth 1 -type f -name '*.tar*'); do
+            s3checkfile "${FILENAME}"
 
-        s3checkfile "${FILENAME}"
-        if [ "$filestatus" -eq 404 ]; then
-            s3upload "${FILENAME}"
-        elif [ "$filestatus" -eq 200 ]; then 
-            echo "[-] ${FILENAME} exists, skipping"
-        else
-            echo "[x] Error checking status of ${FILENAME} error code: ${filestatus}"
-            exit 1
-        fi
-        rm "${TARFILE}"
+            if [ "${filestatus}" -eq 404 ]; then
+                s3upload "${FILENAME}"
+            elif [ "$filestatus" -eq 200 ]; then 
+                echo "[-] ${FILENAME} exists, skipping"
+            else
+                echo "[x] Error checking status of ${FILENAME} error code: ${filestatus}"
+                exit 1
+            fi
+        done;
 
         echo "[<] Main loop handling ${FOLDERNAME} done"
         updateruntime
