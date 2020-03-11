@@ -16,6 +16,9 @@ if [ "$1" == "-h" ]; then
 fi
 
 MINSPACEFREE=1000000000
+MAXRETRIES=3
+SPLIT_MB="100m"
+SPLIT_NUM=102400
 
 ############################################################################################################################
 # CONFIG HANDLING
@@ -112,6 +115,23 @@ s3upload () {
         echo "[!] s3upload() with no path, exiting"
         exit 1
     fi
+
+    if [ -n "$2" ]; then
+        RETRIES=$2
+        if [ $RETRIES -gt $MAXRETRIES ]; then
+            echo "[x] More than ${MAXRETRIES} retries, giving up."
+            echo "[x] s3upload(${AWS_BUCKET}/${file}) failed: http status code: $UPLOADSTATUS"
+            echo "###############################################"
+            echo "$RETVAL"
+            echo "###############################################"
+            echo "[!] Removing temp file ${TEMPARCHIVEDIR}/${file}"
+            rm -f "${TEMPARCHIVEDIR}/${file}"
+            exit 1
+        fi
+    else
+        RETRIES=1
+    fi
+
     local file
     local dateValue
     local stringToSign
@@ -132,22 +152,22 @@ s3upload () {
             -H "Content-Type: application/x-compressed-tar" \
             -H "Authorization: AWS ${s3Key}:${signature}" \
             "https://${AWS_BUCKET}.s3-${AWS_REGION}.amazonaws.com/${file}" 2>&1 )
-
-        echo "[!] Removing temp file ${TEMPARCHIVEDIR}/${file}"
-        rm -f "${TEMPARCHIVEDIR}/${file}"
     else
         echo "[!] Skipping upload, setting it as successful for debugging"
         RETVAL="HTTP/1.1 200"
     fi
-    UPLOADSTATUS=$( echo "${RETVAL}" | grep -v '100 Continue' | grep -E '^HTTP' |  awk '{print $2}' | head -n1)
+    UPLOADSTATUS=$( echo "${RETVAL}" | grep -E '^HTTP' |  awk '{print $2}' | tail -n1 | tr -d '[:space:]')
+
     if [ $UPLOADSTATUS -eq 200 ]; then
         echo "[<] s3upload(${AWS_BUCKET}/${file}) success"
+        echo "[!] Removing temp file ${TEMPARCHIVEDIR}/${file}"
+        rm -f "${TEMPARCHIVEDIR}/${file}"
     else
-        echo "[x] s3upload(${AWS_BUCKET}/${file}) failed: http status code: $UPLOADSTATUS"
-        echo "###############################################"
-        echo "$RETVAL"
-        echo "###############################################"
-        exit 1
+        echo "[!] Something failed, trying again in 30 seconds, attempt #${RETRIES}"
+        echo "curl output:"
+        echo "${RETVAL}"
+        sleep 30
+        s3upload "$1" "$($RETRIES + 1)"
     fi
 }
 
@@ -209,9 +229,9 @@ compressfolder () {
         echo "[!] NOOP compressfolder(${ARCHIVEFOLDER})"
     else
         echo "[>] compressfolder(${ARCHIVEFOLDER}) Starting"
-        if [ $FOLDERSIZE -gt 304800 ]; then
-            echo "[!] splitting into 300MB chunks"
-            tar --no-acls -cf - "${ARCHIVEFOLDER}" | split -b 300m - "${TARFILE}." 
+        if [ $FOLDERSIZE -gt $SPLIT_NUM ]; then
+            echo "[!] splitting into ${SPLIT_MB} chunks"
+            tar --no-acls -cf - "${ARCHIVEFOLDER}" | split -b "${SPLIT_MB}" - "${TARFILE}." 
             echo "[!] Combined archive size: $(du -sh "${TARFILE}.*")"
         else
             tar --no-acls -cf "${TARFILE}" "${ARCHIVEFOLDER}"
@@ -252,9 +272,10 @@ while [ $RUNTIME -lt $MAXTIME ]; do
         
         for FILENAME in $(find "${TEMPARCHIVEDIR}" -maxdepth 1 -type f -name '*.tar*'); do
             s3checkfile "${FILENAME}"
-
+            
             if [ "${filestatus}" -eq 404 ]; then
                 s3upload "${FILENAME}"
+                sleep 5
             elif [ "$filestatus" -eq 200 ]; then 
                 echo "[-] ${FILENAME} exists, skipping"
             else
