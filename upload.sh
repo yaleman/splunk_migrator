@@ -282,6 +282,10 @@ while [ $RUNTIME -lt $MAXTIME ]; do
                 echo "[x] Error checking status of ${FILENAME} error code: ${filestatus}"
                 exit 1
             fi
+            if [ -f "${FILENAME}" ]; then
+                echo "[!] Cleaning up ${FILENAME}"
+                rm "${FILENAME}"
+            fi
         done;
 
         echo "[<] Main loop handling ${FOLDERNAME} done"
